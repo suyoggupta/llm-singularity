@@ -13,6 +13,7 @@
 #include "kernels/rmsnorm.h"
 #include "kernels/activations.h"
 #include "kernels/rope.h"
+#include "kernels/cublas_provider.h"
 
 // ---------------------------------------------------------------------------
 // Helper: CUDA memory RAII wrapper
@@ -241,4 +242,50 @@ TEST(KernelTest, RoPEPositionZero) {
         EXPECT_NEAR(h_q_out[i], h_q[i], 1e-5f);
         EXPECT_NEAR(h_k_out[i], h_k[i], 1e-5f);
     }
+}
+
+// ---------------------------------------------------------------------------
+// CublasProvider GEMM Test
+// ---------------------------------------------------------------------------
+TEST(KernelTest, CublasGemm) {
+    // 2x3 * 3x4 = 2x4 matmul in float32
+    const int M = 2, N = 4, K = 3;
+    // A is row-major [2,3], B is row-major [3,4]
+    std::vector<float> h_A = {1, 2, 3, 4, 5, 6};
+    std::vector<float> h_B = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    std::vector<float> h_C(M * N, 0.0f);
+
+    float *d_A, *d_B, *d_C;
+    cudaMalloc(&d_A, M * K * sizeof(float));
+    cudaMalloc(&d_B, K * N * sizeof(float));
+    cudaMalloc(&d_C, M * N * sizeof(float));
+    cudaMemcpy(d_A, h_A.data(), M * K * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, h_B.data(), K * N * sizeof(float), cudaMemcpyHostToDevice);
+
+    CublasProvider provider;
+    GemmDescriptor desc;
+    desc.M = M;
+    desc.N = N;
+    desc.K = K;
+    desc.input_dtype = DataType::kFloat32;
+    desc.output_dtype = DataType::kFloat32;
+
+    provider.gemm(desc, d_A, d_B, d_C, nullptr);
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(h_C.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // C = A * B (row-major)
+    // C[0][0] = 1*1 + 2*5 + 3*9 = 38
+    // C[0][1] = 1*2 + 2*6 + 3*10 = 44
+    // C[0][2] = 1*3 + 2*7 + 3*11 = 50
+    // C[0][3] = 1*4 + 2*8 + 3*12 = 56
+    // C[1][0] = 4*1 + 5*5 + 6*9 = 83
+    EXPECT_NEAR(h_C[0], 38.0f, 1e-3);
+    EXPECT_NEAR(h_C[1], 44.0f, 1e-3);
+    EXPECT_NEAR(h_C[2], 50.0f, 1e-3);
+    EXPECT_NEAR(h_C[3], 56.0f, 1e-3);
+    EXPECT_NEAR(h_C[4], 83.0f, 1e-3);
+
+    cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
 }

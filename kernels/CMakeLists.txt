@@ -6,4 +6,4 @@ add_library(kernels STATIC
     src/rope.cu
 )
 target_include_directories(kernels PUBLIC include)
-target_link_libraries(kernels PUBLIC CUDA::cublas CUDA::cudart)
+target_link_libraries(kernels PUBLIC core CUDA::cublas CUDA::cudart)
