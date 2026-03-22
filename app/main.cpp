@@ -84,14 +84,19 @@ bool is_hf_model_id(const std::string& model_dir) {
 // Returns the local path to the downloaded model directory.
 std::string download_hf_model(const std::string& model_id,
                                const std::string& hf_token) {
-    // Locate the download script relative to the executable
-    // Fall back to tools/download_model.py in cwd
+    // Locate the download script: try cwd first, then relative to executable.
+    // Exe is at build/app/llm-serve-llama → repo root is 3 levels up.
     std::string script = "tools/download_model.py";
     if (!std::filesystem::exists(script)) {
-        // Try relative to executable
         auto exe_path = std::filesystem::read_symlink("/proc/self/exe");
-        auto exe_dir = exe_path.parent_path().parent_path(); // build/../
-        script = (exe_dir / "tools" / "download_model.py").string();
+        // build/app/llm-serve-llama → build/app → build → repo_root
+        auto repo_root = exe_path.parent_path().parent_path().parent_path();
+        script = (repo_root / "tools" / "download_model.py").string();
+    }
+    if (!std::filesystem::exists(script)) {
+        throw std::runtime_error(
+            "Cannot find tools/download_model.py. "
+            "Run from the repo root or set --model-dir to a local path.");
     }
 
     std::string cmd = "python3 " + script + " " + model_id;
