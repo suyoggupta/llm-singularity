@@ -4,6 +4,9 @@ add_library(kernels STATIC
     src/rmsnorm.cu
     src/activations.cu
     src/rope.cu
+    src/embedding.cu
+    src/kv_cache.cu
+    src/residual.cu
 )
 target_include_directories(kernels PUBLIC include)
 target_link_libraries(kernels PUBLIC core CUDA::cublas CUDA::cudart)

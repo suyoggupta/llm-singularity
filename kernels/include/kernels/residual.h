@@ -7,7 +7,8 @@
 // license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 #pragma once
+#include <cuda_runtime.h>
 
-// Runtime functionality is merged into llama_model.h.
-// This header exists for backward compatibility with CMakeLists.txt.
-#include "llama_model.h"
+/// Element-wise vector addition: output[i] = a[i] + b[i]
+void launch_residual_add(const float* a, const float* b, float* output,
+                          int size, cudaStream_t stream);
