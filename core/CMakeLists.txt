@@ -4,6 +4,7 @@ add_library(core STATIC
     src/tokenizer.cpp
     src/sampling.cpp
     src/memory.cpp
+    src/safetensors.cpp
 )
 target_include_directories(core PUBLIC include)
 target_include_directories(core PRIVATE
