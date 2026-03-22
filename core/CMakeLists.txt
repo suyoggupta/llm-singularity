@@ -6,7 +6,7 @@ add_library(core STATIC
     src/memory.cpp
     src/safetensors.cpp
 )
-target_include_directories(core PUBLIC include)
+target_include_directories(core PUBLIC include ${CMAKE_SOURCE_DIR}/models/include ${CMAKE_SOURCE_DIR}/kernels/include)
 target_include_directories(core PRIVATE
     ${sentencepiece_SOURCE_DIR}/src
 )
