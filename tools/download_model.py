@@ -27,7 +27,7 @@ def main():
         print("ERROR: huggingface_hub not installed. Run: pip install huggingface_hub", file=sys.stderr)
         sys.exit(1)
 
-    cache_dir = os.path.expanduser("~/.cache/llm-singularity")
+    cache_dir = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
 
     print(f"Downloading {args.model_id} to {cache_dir}...", file=sys.stderr)
 
