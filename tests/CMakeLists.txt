@@ -7,6 +7,7 @@ add_executable(tests
     test_safetensors.cpp
     test_scheduler.cpp
     test_llama_model.cpp
+    test_server.cpp
 )
 target_link_libraries(tests PRIVATE core kernels llama_model GTest::gtest_main)
 add_test(NAME unit_tests COMMAND tests)
