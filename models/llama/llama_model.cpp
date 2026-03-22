@@ -7,6 +7,7 @@
 // license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 #include "llama_model.h"
+#include "kernels/attention.h"
 #include "kernels/embedding.h"
 #include "kernels/kv_cache.h"
 #include "kernels/residual.h"
@@ -268,13 +269,15 @@ void LlamaModel::load_weights(const std::string& weight_path) {
     cudaMalloc(&workspace_, workspace_size_);
     cudaMemset(workspace_, 0, workspace_size_);
 
-    // 5. Allocate KV cache
+    // 5. Allocate KV cache — per-layer pools
     auto kvc = kv_cache_config();
     kv_cache_num_blocks_ = kvc.max_blocks;
-    // Each block: [num_kv_heads, block_size, head_dim] floats
-    size_t block_elems = static_cast<size_t>(config_.num_kv_heads) *
-                         kvc.block_size * head_dim();
-    size_t cache_bytes = kv_cache_num_blocks_ * block_elems * sizeof(float);
+    kv_block_elems_ = static_cast<size_t>(config_.num_kv_heads) *
+                      kvc.block_size * head_dim();
+    // Total: num_layers * num_blocks * block_elems
+    size_t total_cache_elems = static_cast<size_t>(config_.num_layers) *
+                               kv_cache_num_blocks_ * kv_block_elems_;
+    size_t cache_bytes = total_cache_elems * sizeof(float);
     cudaMalloc(&k_cache_, cache_bytes);
     cudaMalloc(&v_cache_, cache_bytes);
     cudaMemset(k_cache_, 0, cache_bytes);
@@ -427,8 +430,14 @@ void LlamaModel::forward_impl(const std::vector<RequestContext>& requests,
     gemm_desc.output_dtype = DataType::kFloat32;
 
     // Build block_table for paged attention (per-request, padded)
-    int max_blocks_per_seq =
-        (config_.max_seq_len + kvc.block_size - 1) / kvc.block_size;
+    // Use the actual max block table size, not config_.max_seq_len
+    int max_blocks_per_seq = 0;
+    for (const auto& req : requests) {
+        max_blocks_per_seq = std::max(max_blocks_per_seq,
+                                       static_cast<int>(req.block_table.size()));
+    }
+    if (max_blocks_per_seq == 0) max_blocks_per_seq = 1;
+
     std::vector<int> flat_block_table(
         requests.size() * max_blocks_per_seq, 0);
     for (size_t r = 0; r < requests.size(); ++r) {
@@ -524,52 +533,36 @@ void LlamaModel::forward_impl(const std::vector<RequestContext>& requests,
                        d_positions, rope_theta_,
                        DataType::kFloat32, stream);
 
-        // d. KV cache scatter
-        launch_kv_cache_scatter(k_buf, v_buf, k_cache_, v_cache_,
+        // d. KV cache scatter — write to THIS layer's cache
+        float* k_cache_l = k_cache_layer(layer);
+        float* v_cache_l = v_cache_layer(layer);
+        launch_kv_cache_scatter(k_buf, v_buf, k_cache_l, v_cache_l,
                                 d_block_indices, d_block_offsets,
                                 total_tokens, num_kv_h, hdim,
                                 kvc.block_size, stream);
 
-        // e. Attention
+        // e. Attention — read from THIS layer's cache
         if (!is_prefill) {
             // Decode: paged attention (one query per request)
-            AttentionDescriptor attn_desc{};
-            attn_desc.batch_size = static_cast<int>(requests.size());
-            attn_desc.num_heads = num_heads;
-            attn_desc.num_kv_heads = num_kv_h;
-            attn_desc.head_dim = hdim;
-            attn_desc.max_seq_len = config_.max_seq_len;
-            attn_desc.dtype = DataType::kFloat32;
-
-            kernels_->fused_attention(attn_desc, q_buf, k_cache_, v_cache_,
-                                      attn_out, d_attn_block_table,
-                                      kvc.block_size, d_seq_lens, stream);
+            launch_paged_attention(
+                q_buf, k_cache_l, v_cache_l, attn_out,
+                d_attn_block_table, max_blocks_per_seq,
+                d_seq_lens,
+                static_cast<int>(requests.size()),
+                num_heads, num_kv_h, hdim,
+                kvc.block_size, stream);
         } else {
-            // Prefill: use paged attention kernel too.
-            // For prefill with multiple tokens per request, we process
-            // one request at a time through the attention kernel.
-            // This is a simplification for the prototype.
+            // Prefill: call paged attention per request.
+            // Each token in the request gets treated as a separate batch item,
+            // each attending to its causal prefix.
             int tok_offset = 0;
             for (size_t r = 0; r < requests.size(); ++r) {
                 int num_tok = tokens_per_request[r];
-                // For prefill, we treat it as batch=num_tok queries,
-                // each attending to increasing prefix lengths.
-                // Simple approach: use paged attention with seq_len = full
-                // prefix for the last token (conservative but correct for
-                // prototype).
-                // Actually, for prefill we do a simpler dense attention:
-                // Each token attends to all tokens up to and including itself.
-                // The paged attention kernel expects batch_size queries.
-                // We'll call it per-request with the request's block table.
 
-                int req_max_blocks = static_cast<int>(
-                    requests[r].block_table.size());
-                if (req_max_blocks == 0) req_max_blocks = 1;
+                int req_max_blocks = std::max(
+                    1, static_cast<int>(requests[r].block_table.size()));
 
-                // Upload this request's block table
-                int* d_req_bt = nullptr;
-                cudaMalloc(&d_req_bt, num_tok * req_max_blocks * sizeof(int));
-                // Each "batch item" (token) uses the same block table
+                // Build per-token block table (each token uses same blocks)
                 std::vector<int> req_bt(num_tok * req_max_blocks, 0);
                 for (int t = 0; t < num_tok; ++t) {
                     for (size_t b = 0;
@@ -578,6 +571,8 @@ void LlamaModel::forward_impl(const std::vector<RequestContext>& requests,
                             requests[r].block_table[b];
                     }
                 }
+                int* d_req_bt = nullptr;
+                cudaMalloc(&d_req_bt, req_bt.size() * sizeof(int));
                 cudaMemcpyAsync(d_req_bt, req_bt.data(),
                                 req_bt.size() * sizeof(int),
                                 cudaMemcpyHostToDevice, stream);
@@ -593,21 +588,14 @@ void LlamaModel::forward_impl(const std::vector<RequestContext>& requests,
                                 num_tok * sizeof(int),
                                 cudaMemcpyHostToDevice, stream);
 
-                AttentionDescriptor attn_desc{};
-                attn_desc.batch_size = num_tok;
-                attn_desc.num_heads = num_heads;
-                attn_desc.num_kv_heads = num_kv_h;
-                attn_desc.head_dim = hdim;
-                attn_desc.max_seq_len = config_.max_seq_len;
-                attn_desc.dtype = DataType::kFloat32;
-
-                kernels_->fused_attention(
-                    attn_desc,
+                launch_paged_attention(
                     q_buf + tok_offset * num_heads * hdim,
-                    k_cache_, v_cache_,
+                    k_cache_l, v_cache_l,
                     attn_out + tok_offset * H,
-                    d_req_bt, kvc.block_size,
-                    d_tok_sl, stream);
+                    d_req_bt, req_max_blocks,
+                    d_tok_sl,
+                    num_tok, num_heads, num_kv_h, hdim,
+                    kvc.block_size, stream);
 
                 cudaFree(d_req_bt);
                 cudaFree(d_tok_sl);

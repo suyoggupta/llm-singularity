@@ -53,10 +53,20 @@ private:
     };
     std::vector<LayerWeights> layers_;
 
-    // KV cache pools
+    // KV cache pools — per-layer. Each layer has its own k_cache and v_cache
+    // region. Total pool: num_layers * num_blocks * block_elems.
     float* k_cache_ = nullptr;
     float* v_cache_ = nullptr;
     size_t kv_cache_num_blocks_ = 0;
+    size_t kv_block_elems_ = 0;  // num_kv_heads * block_size * head_dim
+
+    // Get per-layer cache pointer
+    float* k_cache_layer(int layer) const {
+        return k_cache_ + static_cast<size_t>(layer) * kv_cache_num_blocks_ * kv_block_elems_;
+    }
+    float* v_cache_layer(int layer) const {
+        return v_cache_ + static_cast<size_t>(layer) * kv_cache_num_blocks_ * kv_block_elems_;
+    }
 
     // Workspace
     float* workspace_ = nullptr;
