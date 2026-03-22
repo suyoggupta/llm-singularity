@@ -38,7 +38,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
-    && pip3 install --no-cache-dir huggingface_hub \
+    && pip3 install --no-cache-dir huggingface_hub transformers \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -46,8 +46,8 @@ WORKDIR /app
 # Copy the built binary
 COPY --from=builder /src/build/app/llm-serve-llama /app/llm-serve-llama
 
-# Copy the download script
-COPY tools/download_model.py /app/tools/download_model.py
+# Copy tools
+COPY tools/ /app/tools/
 
 # Cache dir for downloaded models (mount a volume here for persistence)
 ENV HF_HOME=/app/.cache
