@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION &
 // AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <filesystem>
 #include <functional>
 #include <iostream>
 #include <mutex>
@@ -31,10 +34,18 @@ struct Args {
     std::string model_dir;
     std::string host = "0.0.0.0";
     int port = 8000;
+    std::string hf_token;
 
     static void print_usage() {
-        std::cerr << "Usage: llm-serve --model-dir <path> [--host <addr>] "
-                     "[--port <port>]\n";
+        std::cerr
+            << "Usage: llm-serve --model-dir <path-or-hf-model-id> "
+               "[--hf-token <token>] [--host <addr>] [--port <port>]\n"
+            << "\n"
+            << "  --model-dir   Local path to model weights, or a HuggingFace\n"
+            << "                model ID (e.g. meta-llama/Llama-3.2-1B).\n"
+            << "                If an HF ID is given, the model is downloaded\n"
+            << "                automatically.\n"
+            << "  --hf-token    HuggingFace auth token (for gated models).\n";
     }
 };
 
@@ -44,6 +55,8 @@ Args parse_args(int argc, char** argv) {
         std::string arg = argv[i];
         if (arg == "--model-dir" && i + 1 < argc) {
             args.model_dir = argv[++i];
+        } else if (arg == "--hf-token" && i + 1 < argc) {
+            args.hf_token = argv[++i];
         } else if (arg == "--host" && i + 1 < argc) {
             args.host = argv[++i];
         } else if (arg == "--port" && i + 1 < argc) {
@@ -54,6 +67,91 @@ Args parse_args(int argc, char** argv) {
         }
     }
     return args;
+}
+
+// ---------------------------------------------------------------------------
+// HuggingFace model download helper
+// ---------------------------------------------------------------------------
+
+// Returns true if model_dir looks like a HF model ID (contains '/' but is not
+// an existing local directory).
+bool is_hf_model_id(const std::string& model_dir) {
+    if (model_dir.find('/') == std::string::npos) return false;
+    return !std::filesystem::is_directory(model_dir);
+}
+
+// Download a HF model using tools/download_model.py.
+// Returns the local path to the downloaded model directory.
+std::string download_hf_model(const std::string& model_id,
+                               const std::string& hf_token) {
+    // Locate the download script relative to the executable
+    // Fall back to tools/download_model.py in cwd
+    std::string script = "tools/download_model.py";
+    if (!std::filesystem::exists(script)) {
+        // Try relative to executable
+        auto exe_path = std::filesystem::read_symlink("/proc/self/exe");
+        auto exe_dir = exe_path.parent_path().parent_path(); // build/../
+        script = (exe_dir / "tools" / "download_model.py").string();
+    }
+
+    std::string cmd = "python3 " + script + " " + model_id;
+    if (!hf_token.empty()) {
+        cmd += " --token " + hf_token;
+    }
+    cmd += " 2>&1";
+
+    std::array<char, 4096> buffer;
+    std::string output;
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) {
+        throw std::runtime_error("Failed to run download script: " + cmd);
+    }
+    while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
+        output += buffer.data();
+        // Print download progress to stderr
+        std::cerr << buffer.data();
+    }
+    int status = pclose(pipe);
+    if (status != 0) {
+        throw std::runtime_error(
+            "Model download failed (exit code "
+            + std::to_string(WEXITSTATUS(status)) + ")");
+    }
+
+    // Last line of output is the local path
+    auto last_newline = output.rfind('\n', output.size() - 2);
+    std::string path;
+    if (last_newline != std::string::npos) {
+        path = output.substr(last_newline + 1);
+    } else {
+        path = output;
+    }
+    // Trim trailing whitespace
+    while (!path.empty() && (path.back() == '\n' || path.back() == '\r'
+                              || path.back() == ' ')) {
+        path.pop_back();
+    }
+
+    if (path.empty() || !std::filesystem::is_directory(path)) {
+        throw std::runtime_error(
+            "Download script did not return a valid path. Got: '" + path + "'");
+    }
+    return path;
+}
+
+// Resolve --model-dir: if it's a local directory, use it directly.
+// If it looks like a HF model ID, download it first.
+std::string resolve_model_path(const std::string& model_dir,
+                                const std::string& hf_token) {
+    if (is_hf_model_id(model_dir)) {
+        std::cout << "[init] Detected HuggingFace model ID: " << model_dir
+                  << "\n";
+        std::cout << "[init] Downloading model...\n";
+        std::string local_path = download_hf_model(model_dir, hf_token);
+        std::cout << "[init] Model downloaded to: " << local_path << "\n";
+        return local_path;
+    }
+    return model_dir;
 }
 
 // ---------------------------------------------------------------------------
@@ -80,7 +178,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::cout << "[init] model-dir: " << args.model_dir << "\n";
+    // Resolve model path (download from HF if needed)
+    std::string model_path = resolve_model_path(args.model_dir, args.hf_token);
+
+    std::cout << "[init] model-dir: " << model_path << "\n";
     std::cout << "[init] host: " << args.host << ":" << args.port << "\n";
 
     // 2. Create kernel provider
@@ -90,8 +191,8 @@ int main(int argc, char** argv) {
     // 3. Create model and load weights
     std::cout << "[init] Creating LLaMA model...\n";
     auto model = create_llama_model(kernels.get());
-    std::cout << "[init] Loading weights from " << args.model_dir << "...\n";
-    model->load_weights(args.model_dir);
+    std::cout << "[init] Loading weights from " << model_path << "...\n";
+    model->load_weights(model_path);
 
     ModelConfig model_cfg = model->config();
     KVCacheConfig kv_cfg = model->kv_cache_config();
@@ -102,7 +203,7 @@ int main(int argc, char** argv) {
     // 4. Create tokenizer
     std::cout << "[init] Loading tokenizer...\n";
     Tokenizer tokenizer;
-    tokenizer.load(args.model_dir);
+    tokenizer.load(model_path);
     std::cout << "[init] Tokenizer loaded: vocab_size=" << tokenizer.vocab_size()
               << " eos=" << tokenizer.eos_token_id() << "\n";
 
