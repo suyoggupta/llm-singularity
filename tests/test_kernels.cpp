@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 #include <vector>
 #include <cmath>
+#include "kernels/attention.h"
 #include "kernels/rmsnorm.h"
 #include "kernels/activations.h"
 #include "kernels/rope.h"
@@ -288,4 +289,307 @@ TEST(KernelTest, CublasGemm) {
     EXPECT_NEAR(h_C[4], 83.0f, 1e-3);
 
     cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+}
+
+// ---------------------------------------------------------------------------
+// Paged Attention Tests
+// ---------------------------------------------------------------------------
+TEST(KernelTest, PagedAttentionBasic) {
+    // Decode scenario: batch=1, 1 query token attending to 3 cached KV tokens
+    const int batch_size = 1;
+    const int num_heads = 2;
+    const int num_kv_heads = 2;
+    const int head_dim = 4;
+    const int block_size = 4;
+    const int seq_len = 3;
+    const int num_blocks = 2;  // pool has 2 blocks, we use block 0
+
+    // Q: [batch_size, num_heads, head_dim]
+    std::vector<float> h_Q = {
+        // head 0
+        1.0f, 0.0f, 1.0f, 0.0f,
+        // head 1
+        0.0f, 1.0f, 0.0f, 1.0f,
+    };
+
+    // K cache pool: each block is [num_kv_heads, block_size, head_dim]
+    // We fill block 0 with 3 tokens of data (4th slot unused).
+    const int block_elems = num_kv_heads * block_size * head_dim;
+    std::vector<float> h_k_cache(num_blocks * block_elems, 0.0f);
+    std::vector<float> h_v_cache(num_blocks * block_elems, 0.0f);
+
+    // Fill K cache block 0:
+    // Layout: [kv_head][token_in_block][dim]
+    // kv_head 0:
+    //   token 0: [1, 0, 0, 0]
+    //   token 1: [0, 1, 0, 0]
+    //   token 2: [0, 0, 1, 0]
+    // kv_head 1:
+    //   token 0: [0, 0, 0, 1]
+    //   token 1: [0, 0, 1, 0]
+    //   token 2: [0, 1, 0, 0]
+    auto k_idx = [&](int kv_head, int tok, int d) {
+        return kv_head * block_size * head_dim + tok * head_dim + d;
+    };
+    // kv_head 0
+    h_k_cache[k_idx(0, 0, 0)] = 1.0f;
+    h_k_cache[k_idx(0, 1, 1)] = 1.0f;
+    h_k_cache[k_idx(0, 2, 2)] = 1.0f;
+    // kv_head 1
+    h_k_cache[k_idx(1, 0, 3)] = 1.0f;
+    h_k_cache[k_idx(1, 1, 2)] = 1.0f;
+    h_k_cache[k_idx(1, 2, 1)] = 1.0f;
+
+    // Fill V cache block 0 with distinct values for verification
+    // kv_head 0:
+    //   token 0: [1, 2, 3, 4]
+    //   token 1: [5, 6, 7, 8]
+    //   token 2: [9, 10, 11, 12]
+    // kv_head 1:
+    //   token 0: [13, 14, 15, 16]
+    //   token 1: [17, 18, 19, 20]
+    //   token 2: [21, 22, 23, 24]
+    for (int t = 0; t < 3; t++) {
+        for (int d = 0; d < head_dim; d++) {
+            h_v_cache[k_idx(0, t, d)] = static_cast<float>(t * head_dim + d + 1);
+            h_v_cache[k_idx(1, t, d)] = static_cast<float>(t * head_dim + d + 13);
+        }
+    }
+
+    // Block table: request 0 uses block 0
+    std::vector<int> h_block_table = {0};
+    std::vector<int> h_seq_lens = {seq_len};
+
+    // Compute expected output on CPU
+    float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    std::vector<float> expected(num_heads * head_dim, 0.0f);
+
+    for (int h = 0; h < num_heads; h++) {
+        int kv_h = h;  // num_heads == num_kv_heads, so 1:1 mapping
+        const float* q = h_Q.data() + h * head_dim;
+
+        // Compute scores
+        float scores[3];
+        float max_score = -FLT_MAX;
+        for (int t = 0; t < seq_len; t++) {
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++) {
+                dot += q[d] * h_k_cache[k_idx(kv_h, t, d)];
+            }
+            scores[t] = dot * scale;
+            if (scores[t] > max_score) max_score = scores[t];
+        }
+
+        // Softmax
+        float sum_exp = 0.0f;
+        float probs[3];
+        for (int t = 0; t < seq_len; t++) {
+            probs[t] = std::exp(scores[t] - max_score);
+            sum_exp += probs[t];
+        }
+        for (int t = 0; t < seq_len; t++) {
+            probs[t] /= sum_exp;
+        }
+
+        // Weighted sum of V
+        for (int d = 0; d < head_dim; d++) {
+            float val = 0.0f;
+            for (int t = 0; t < seq_len; t++) {
+                val += probs[t] * h_v_cache[k_idx(kv_h, t, d)];
+            }
+            expected[h * head_dim + d] = val;
+        }
+    }
+
+    // Allocate GPU memory and launch
+    CudaBuffer d_Q(h_Q.size() * sizeof(float));
+    CudaBuffer d_k_cache(h_k_cache.size() * sizeof(float));
+    CudaBuffer d_v_cache(h_v_cache.size() * sizeof(float));
+    CudaBuffer d_output(num_heads * head_dim * sizeof(float));
+    CudaBuffer d_block_table(h_block_table.size() * sizeof(int));
+    CudaBuffer d_seq_lens(h_seq_lens.size() * sizeof(int));
+
+    cudaMemcpy(d_Q.ptr, h_Q.data(), h_Q.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k_cache.ptr, h_k_cache.data(), h_k_cache.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v_cache.ptr, h_v_cache.data(), h_v_cache.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_block_table.ptr, h_block_table.data(), h_block_table.size() * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_seq_lens.ptr, h_seq_lens.data(), h_seq_lens.size() * sizeof(int), cudaMemcpyHostToDevice);
+
+    int max_blocks_per_seq = 1;
+    launch_paged_attention(
+        static_cast<float*>(d_Q.ptr),
+        static_cast<float*>(d_k_cache.ptr),
+        static_cast<float*>(d_v_cache.ptr),
+        static_cast<float*>(d_output.ptr),
+        static_cast<int*>(d_block_table.ptr), max_blocks_per_seq,
+        static_cast<int*>(d_seq_lens.ptr),
+        batch_size, num_heads, num_kv_heads, head_dim,
+        block_size, nullptr);
+    cudaDeviceSynchronize();
+
+    std::vector<float> h_output(num_heads * head_dim);
+    cudaMemcpy(h_output.data(), d_output.ptr, h_output.size() * sizeof(float), cudaMemcpyDeviceToHost);
+
+    for (int i = 0; i < num_heads * head_dim; i++) {
+        EXPECT_NEAR(h_output[i], expected[i], 1e-4f)
+            << "Mismatch at index " << i;
+    }
+}
+
+TEST(KernelTest, PagedAttentionMultiBlock) {
+    // Test with sequence spanning 2 blocks
+    const int batch_size = 1;
+    const int num_heads = 1;
+    const int num_kv_heads = 1;
+    const int head_dim = 4;
+    const int block_size = 2;
+    const int seq_len = 3;  // spans 2 blocks (block 0: tokens 0,1; block 1: token 2)
+    const int num_blocks = 4;
+
+    std::vector<float> h_Q = {1.0f, 1.0f, 1.0f, 1.0f};
+
+    const int block_elems = num_kv_heads * block_size * head_dim;
+    std::vector<float> h_k_cache(num_blocks * block_elems, 0.0f);
+    std::vector<float> h_v_cache(num_blocks * block_elems, 0.0f);
+
+    // Use blocks 2 and 0 (non-contiguous) to test block table indirection
+    // block_table = {2, 0} means: logical block 0 -> physical block 2, logical block 1 -> physical block 0
+    std::vector<int> h_block_table = {2, 0};
+    std::vector<int> h_seq_lens = {seq_len};
+
+    auto cache_idx = [&](int phys_block, int kv_head, int tok, int d) {
+        return phys_block * block_elems + kv_head * block_size * head_dim + tok * head_dim + d;
+    };
+
+    // Token 0 in physical block 2, slot 0: K=[1,0,0,0], V=[1,1,1,1]
+    h_k_cache[cache_idx(2, 0, 0, 0)] = 1.0f;
+    for (int d = 0; d < head_dim; d++) h_v_cache[cache_idx(2, 0, 0, d)] = 1.0f;
+
+    // Token 1 in physical block 2, slot 1: K=[0,1,0,0], V=[2,2,2,2]
+    h_k_cache[cache_idx(2, 0, 1, 1)] = 1.0f;
+    for (int d = 0; d < head_dim; d++) h_v_cache[cache_idx(2, 0, 1, d)] = 2.0f;
+
+    // Token 2 in physical block 0, slot 0: K=[0,0,1,0], V=[3,3,3,3]
+    h_k_cache[cache_idx(0, 0, 0, 2)] = 1.0f;
+    for (int d = 0; d < head_dim; d++) h_v_cache[cache_idx(0, 0, 0, d)] = 3.0f;
+
+    // CPU reference
+    float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    // Q = [1,1,1,1], K0=[1,0,0,0] -> dot=1, K1=[0,1,0,0] -> dot=1, K2=[0,0,1,0] -> dot=1
+    // All scores equal => uniform softmax => output = mean of V = (1+2+3)/3 = 2.0 per dim
+    // scores = [1*scale, 1*scale, 1*scale], all equal, so probs = [1/3, 1/3, 1/3]
+    float expected_val = (1.0f + 2.0f + 3.0f) / 3.0f;
+
+    CudaBuffer d_Q(h_Q.size() * sizeof(float));
+    CudaBuffer d_k_cache(h_k_cache.size() * sizeof(float));
+    CudaBuffer d_v_cache(h_v_cache.size() * sizeof(float));
+    CudaBuffer d_output(head_dim * sizeof(float));
+    CudaBuffer d_block_table(h_block_table.size() * sizeof(int));
+    CudaBuffer d_seq_lens(h_seq_lens.size() * sizeof(int));
+
+    cudaMemcpy(d_Q.ptr, h_Q.data(), h_Q.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k_cache.ptr, h_k_cache.data(), h_k_cache.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v_cache.ptr, h_v_cache.data(), h_v_cache.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_block_table.ptr, h_block_table.data(), h_block_table.size() * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_seq_lens.ptr, h_seq_lens.data(), h_seq_lens.size() * sizeof(int), cudaMemcpyHostToDevice);
+
+    int max_blocks_per_seq = 2;
+    launch_paged_attention(
+        static_cast<float*>(d_Q.ptr),
+        static_cast<float*>(d_k_cache.ptr),
+        static_cast<float*>(d_v_cache.ptr),
+        static_cast<float*>(d_output.ptr),
+        static_cast<int*>(d_block_table.ptr), max_blocks_per_seq,
+        static_cast<int*>(d_seq_lens.ptr),
+        batch_size, num_heads, num_kv_heads, head_dim,
+        block_size, nullptr);
+    cudaDeviceSynchronize();
+
+    std::vector<float> h_output(head_dim);
+    cudaMemcpy(h_output.data(), d_output.ptr, head_dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+    for (int d = 0; d < head_dim; d++) {
+        EXPECT_NEAR(h_output[d], expected_val, 1e-4f)
+            << "Mismatch at dim " << d;
+    }
+}
+
+TEST(KernelTest, PagedAttentionViaProvider) {
+    // Test through the CublasProvider interface
+    const int batch_size = 1;
+    const int num_heads = 1;
+    const int num_kv_heads = 1;
+    const int head_dim = 4;
+    const int block_size = 4;
+    const int seq_len = 2;
+
+    // Q = [1, 0, 0, 0]
+    std::vector<float> h_Q = {1.0f, 0.0f, 0.0f, 0.0f};
+
+    const int block_elems = num_kv_heads * block_size * head_dim;
+    std::vector<float> h_k_cache(block_elems, 0.0f);
+    std::vector<float> h_v_cache(block_elems, 0.0f);
+
+    // K token 0: [1,0,0,0] -> score = 1/sqrt(4) = 0.5
+    // K token 1: [0,0,0,0] -> score = 0
+    h_k_cache[0] = 1.0f;
+
+    // V token 0: [10, 20, 30, 40], V token 1: [50, 60, 70, 80]
+    h_v_cache[0] = 10.0f; h_v_cache[1] = 20.0f; h_v_cache[2] = 30.0f; h_v_cache[3] = 40.0f;
+    h_v_cache[4] = 50.0f; h_v_cache[5] = 60.0f; h_v_cache[6] = 70.0f; h_v_cache[7] = 80.0f;
+
+    std::vector<int> h_block_table = {0};
+    std::vector<int> h_seq_lens = {seq_len};
+
+    // CPU reference
+    float scale = 1.0f / std::sqrt(4.0f);  // 0.5
+    float s0 = 1.0f * scale;  // 0.5
+    float s1 = 0.0f * scale;  // 0.0
+    float max_s = s0;
+    float e0 = std::exp(s0 - max_s);  // 1.0
+    float e1 = std::exp(s1 - max_s);  // exp(-0.5)
+    float sum_e = e0 + e1;
+    float p0 = e0 / sum_e;
+    float p1 = e1 / sum_e;
+    std::vector<float> expected = {
+        p0 * 10.0f + p1 * 50.0f,
+        p0 * 20.0f + p1 * 60.0f,
+        p0 * 30.0f + p1 * 70.0f,
+        p0 * 40.0f + p1 * 80.0f,
+    };
+
+    CudaBuffer d_Q(h_Q.size() * sizeof(float));
+    CudaBuffer d_k_cache(h_k_cache.size() * sizeof(float));
+    CudaBuffer d_v_cache(h_v_cache.size() * sizeof(float));
+    CudaBuffer d_output(head_dim * sizeof(float));
+    CudaBuffer d_block_table(h_block_table.size() * sizeof(int));
+    CudaBuffer d_seq_lens(h_seq_lens.size() * sizeof(int));
+
+    cudaMemcpy(d_Q.ptr, h_Q.data(), h_Q.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k_cache.ptr, h_k_cache.data(), h_k_cache.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v_cache.ptr, h_v_cache.data(), h_v_cache.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_block_table.ptr, h_block_table.data(), h_block_table.size() * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_seq_lens.ptr, h_seq_lens.data(), h_seq_lens.size() * sizeof(int), cudaMemcpyHostToDevice);
+
+    CublasProvider provider;
+    AttentionDescriptor desc;
+    desc.batch_size = batch_size;
+    desc.num_heads = num_heads;
+    desc.num_kv_heads = num_kv_heads;
+    desc.head_dim = head_dim;
+    desc.max_seq_len = seq_len;
+    desc.dtype = DataType::kFloat32;
+
+    provider.fused_attention(desc, d_Q.ptr, d_k_cache.ptr, d_v_cache.ptr,
+                              d_output.ptr, static_cast<int*>(d_block_table.ptr),
+                              block_size, static_cast<int*>(d_seq_lens.ptr), nullptr);
+    cudaDeviceSynchronize();
+
+    std::vector<float> h_output(head_dim);
+    cudaMemcpy(h_output.data(), d_output.ptr, head_dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+    for (int d = 0; d < head_dim; d++) {
+        EXPECT_NEAR(h_output[d], expected[d], 1e-4f)
+            << "Mismatch at dim " << d;
+    }
 }

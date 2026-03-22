@@ -7,6 +7,7 @@
 // license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 #include "kernels/cublas_provider.h"
+#include "kernels/attention.h"
 #include "kernels/rmsnorm.h"
 #include "kernels/activations.h"
 #include "kernels/rope.h"
@@ -54,9 +55,21 @@ void CublasProvider::fused_attention(AttentionDescriptor desc,
                                       void* output, const int* block_table,
                                       int block_size, const int* seq_lens,
                                       cudaStream_t stream) {
-    (void)desc; (void)Q; (void)K; (void)V; (void)output;
-    (void)block_table; (void)block_size; (void)seq_lens; (void)stream;
-    throw std::runtime_error("CublasProvider::fused_attention not yet implemented — use Task 9");
+    if (desc.dtype != DataType::kFloat32) {
+        throw std::runtime_error("CublasProvider::fused_attention only supports float32");
+    }
+
+    int max_blocks_per_seq = (desc.max_seq_len + block_size - 1) / block_size;
+
+    launch_paged_attention(
+        static_cast<const float*>(Q),
+        static_cast<const float*>(K),
+        static_cast<const float*>(V),
+        static_cast<float*>(output),
+        block_table, max_blocks_per_seq,
+        seq_lens,
+        desc.batch_size, desc.num_heads, desc.num_kv_heads, desc.head_dim,
+        block_size, stream);
 }
 
 void CublasProvider::rms_norm(const void* input, const void* weight, void* output,
