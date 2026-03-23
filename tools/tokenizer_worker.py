@@ -51,7 +51,7 @@ def main():
                 print(json.dumps({"ids": ids}), flush=True)
 
             elif cmd == "decode":
-                text = tokenizer.decode(req["ids"], skip_special_tokens=False)
+                text = tokenizer.decode(req["ids"], skip_special_tokens=True)
                 print(json.dumps({"text": text}), flush=True)
 
             elif cmd == "info":

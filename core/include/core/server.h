@@ -51,10 +51,16 @@ using GenerateCallback = std::function<void(
     const std::string& prompt_text, const SamplingParams& params, int max_tokens,
     bool stream, std::function<void(const std::string& token, bool done)> stream_cb)>;
 
+// Callback type for applying a chat template: accepts role/content pairs,
+// returns the formatted prompt string ready for tokenization.
+using ChatTemplateCallback = std::function<std::string(
+    const std::vector<std::pair<std::string, std::string>>& messages)>;
+
 class Server {
 public:
     Server(const std::string& host, int port, const std::string& model_name,
-           GenerateCallback callback);
+           GenerateCallback callback,
+           ChatTemplateCallback chat_template_fn = nullptr);
     ~Server();
     void start();  // blocking
     void stop();

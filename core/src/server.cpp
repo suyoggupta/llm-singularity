@@ -75,7 +75,7 @@ CompletionRequest parse_completion_request(const std::string& json_body) {
 
 std::string format_sse_chunk(const std::string& model, const std::string& token,
                               const std::string& finish_reason) {
-    json delta;
+    json delta = json::object();
     if (!token.empty()) {
         delta["content"] = token;
     }
@@ -139,9 +139,12 @@ struct Server::Impl {
     int port;
     std::string model_name;
     GenerateCallback callback;
+    ChatTemplateCallback chat_template_fn;
 
-    Impl(const std::string& h, int p, const std::string& m, GenerateCallback cb)
-        : host(h), port(p), model_name(m), callback(std::move(cb)) {
+    Impl(const std::string& h, int p, const std::string& m, GenerateCallback cb,
+         ChatTemplateCallback ct)
+        : host(h), port(p), model_name(m), callback(std::move(cb)),
+          chat_template_fn(std::move(ct)) {
         setup_routes();
     }
 
@@ -180,10 +183,28 @@ struct Server::Impl {
             return;
         }
 
-        // Build a simple prompt from messages (tokenization done in callback)
+        // Format messages using the chat template if available, otherwise fall
+        // back to a naive "role: content\n" concatenation.
         std::string prompt_text;
-        for (const auto& msg : chat_req.messages) {
-            prompt_text += msg.role + ": " + msg.content + "\n";
+        if (chat_template_fn) {
+            std::vector<std::pair<std::string, std::string>> msgs;
+            msgs.reserve(chat_req.messages.size());
+            for (const auto& msg : chat_req.messages) {
+                msgs.push_back({msg.role, msg.content});
+            }
+            try {
+                prompt_text = chat_template_fn(msgs);
+            } catch (const std::exception& e) {
+                res.status = 500;
+                res.set_content(
+                    std::string(R"({"error":"chat template failed: ")") + e.what() + "\"}",
+                    "application/json");
+                return;
+            }
+        } else {
+            for (const auto& msg : chat_req.messages) {
+                prompt_text += msg.role + ": " + msg.content + "\n";
+            }
         }
 
         SamplingParams sp;
@@ -197,19 +218,25 @@ struct Server::Impl {
                 [this, prompt_text, sp, max_tokens = chat_req.max_tokens,
                  mdl = chat_req.model](size_t /*offset*/, httplib::DataSink& sink) -> bool {
                     bool ok = true;
-                    callback(prompt_text, sp, max_tokens, true,
-                             [&](const std::string& token, bool done) {
-                                 if (!ok) return;
-                                 std::string chunk;
-                                 if (done) {
-                                     chunk = format_sse_done(mdl, "stop");
-                                 } else {
-                                     chunk = format_sse_chunk(mdl, token, "");
-                                 }
-                                 if (!sink.write(chunk.c_str(), chunk.size())) {
-                                     ok = false;
-                                 }
-                             });
+                    try {
+                        callback(prompt_text, sp, max_tokens, true,
+                                 [&](const std::string& token, bool done) {
+                                     if (!ok) return;
+                                     std::string chunk;
+                                     if (done) {
+                                         chunk = format_sse_done(mdl, "stop");
+                                     } else {
+                                         chunk = format_sse_chunk(mdl, token, "");
+                                     }
+                                     if (!sink.write(chunk.c_str(), chunk.size())) {
+                                         ok = false;
+                                     }
+                                 });
+                    } catch (const std::exception& e) {
+                        std::string err =
+                            std::string("data: {\"error\":\"") + e.what() + "\"}\n\n";
+                        sink.write(err.c_str(), err.size());
+                    }
                     return false;  // signal end of chunked body
                 });
         } else {
@@ -256,19 +283,25 @@ struct Server::Impl {
                 [this, prompt = comp_req.prompt, sp, max_tokens = comp_req.max_tokens,
                  mdl = comp_req.model](size_t /*offset*/, httplib::DataSink& sink) -> bool {
                     bool ok = true;
-                    callback(prompt, sp, max_tokens, true,
-                             [&](const std::string& token, bool done) {
-                                 if (!ok) return;
-                                 std::string chunk;
-                                 if (done) {
-                                     chunk = format_sse_done(mdl, "stop");
-                                 } else {
-                                     chunk = format_sse_chunk(mdl, token, "");
-                                 }
-                                 if (!sink.write(chunk.c_str(), chunk.size())) {
-                                     ok = false;
-                                 }
-                             });
+                    try {
+                        callback(prompt, sp, max_tokens, true,
+                                 [&](const std::string& token, bool done) {
+                                     if (!ok) return;
+                                     std::string chunk;
+                                     if (done) {
+                                         chunk = format_sse_done(mdl, "stop");
+                                     } else {
+                                         chunk = format_sse_chunk(mdl, token, "");
+                                     }
+                                     if (!sink.write(chunk.c_str(), chunk.size())) {
+                                         ok = false;
+                                     }
+                                 });
+                    } catch (const std::exception& e) {
+                        std::string err =
+                            std::string("data: {\"error\":\"") + e.what() + "\"}\n\n";
+                        sink.write(err.c_str(), err.size());
+                    }
                     return false;
                 });
         } else {
@@ -295,8 +328,9 @@ struct Server::Impl {
 };
 
 Server::Server(const std::string& host, int port, const std::string& model_name,
-               GenerateCallback callback)
-    : impl_(std::make_unique<Impl>(host, port, model_name, std::move(callback))) {}
+               GenerateCallback callback, ChatTemplateCallback chat_template_fn)
+    : impl_(std::make_unique<Impl>(host, port, model_name, std::move(callback),
+                                   std::move(chat_template_fn))) {}
 
 Server::~Server() = default;
 
