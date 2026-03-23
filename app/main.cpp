@@ -306,7 +306,8 @@ int main(int argc, char** argv) {
                             result.logits.data()
                             + static_cast<ptrdiff_t>(i) * result.vocab_size;
                         int32_t token = sampler.sample(
-                            logits_ptr, result.vocab_size, SamplingParams{});
+                            logits_ptr, result.vocab_size,
+                            req.sampling_params);
                         sampled.push_back({req.request_id, token});
                         stream_token(req.request_id,
                                      tokenizer.decode({token}));
@@ -325,7 +326,8 @@ int main(int argc, char** argv) {
                         result.logits.data()
                         + static_cast<ptrdiff_t>(i) * result.vocab_size;
                     int32_t token = sampler.sample(
-                        logits_ptr, result.vocab_size, SamplingParams{});
+                        logits_ptr, result.vocab_size,
+                        batch.decode_requests[i].sampling_params);
                     sampled.push_back(
                         {batch.decode_requests[i].request_id, token});
                     stream_token(batch.decode_requests[i].request_id,
@@ -382,9 +384,14 @@ int main(int argc, char** argv) {
         }
     };
 
+    ChatTemplateCallback chat_tmpl_cb =
+        [&](const std::vector<std::pair<std::string, std::string>>& msgs) {
+            return tokenizer.apply_chat_template(msgs);
+        };
+
     std::cout << "[init] Starting server on " << args.host << ":"
               << args.port << "...\n";
-    Server server(args.host, args.port, model_name, generate_cb);
+    Server server(args.host, args.port, model_name, generate_cb, chat_tmpl_cb);
 
     // Install signal handler for clean shutdown
     // (simplified: just use atexit-style cleanup)

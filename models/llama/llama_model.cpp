@@ -455,6 +455,50 @@ void LlamaModel::forward_impl(const std::vector<RequestContext>& requests,
                     flat_block_table.size() * sizeof(int),
                     cudaMemcpyHostToDevice, stream);
 
+    // Pre-allocate per-request prefill block tables and seq_lens.
+    // These are identical across all layers, so we upload them once here
+    // and reuse them every layer, avoiding use-after-free races.
+    struct PrefillRequestBuffers {
+        int* d_bt = nullptr;       // [num_tok * req_max_blocks]
+        int* d_sl = nullptr;       // [num_tok]
+        int  num_tok = 0;
+        int  req_max_blocks = 0;
+    };
+    std::vector<PrefillRequestBuffers> prefill_bufs;
+    if (is_prefill) {
+        prefill_bufs.resize(requests.size());
+        for (size_t r = 0; r < requests.size(); ++r) {
+            int num_tok = tokens_per_request[r];
+            int req_max_blocks = std::max(
+                1, static_cast<int>(requests[r].block_table.size()));
+
+            std::vector<int> req_bt(num_tok * req_max_blocks, 0);
+            for (int t = 0; t < num_tok; ++t) {
+                for (size_t b = 0; b < requests[r].block_table.size(); ++b) {
+                    req_bt[t * req_max_blocks + b] =
+                        requests[r].block_table[b];
+                }
+            }
+            std::vector<int> tok_seq_lens(num_tok);
+            for (int t = 0; t < num_tok; ++t) {
+                tok_seq_lens[t] = requests[r].prefill_start_pos + t + 1;
+            }
+
+            cudaMalloc(&prefill_bufs[r].d_bt,
+                       req_bt.size() * sizeof(int));
+            cudaMalloc(&prefill_bufs[r].d_sl,
+                       num_tok * sizeof(int));
+            cudaMemcpyAsync(prefill_bufs[r].d_bt, req_bt.data(),
+                            req_bt.size() * sizeof(int),
+                            cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(prefill_bufs[r].d_sl, tok_seq_lens.data(),
+                            num_tok * sizeof(int),
+                            cudaMemcpyHostToDevice, stream);
+            prefill_bufs[r].num_tok = num_tok;
+            prefill_bufs[r].req_max_blocks = req_max_blocks;
+        }
+    }
+
     for (int layer = 0; layer < config_.num_layers; ++layer) {
         const auto& lw = layers_[layer];
 
@@ -536,6 +580,7 @@ void LlamaModel::forward_impl(const std::vector<RequestContext>& requests,
         // d. KV cache scatter — write to THIS layer's cache
         float* k_cache_l = k_cache_layer(layer);
         float* v_cache_l = v_cache_layer(layer);
+
         launch_kv_cache_scatter(k_buf, v_buf, k_cache_l, v_cache_l,
                                 d_block_indices, d_block_offsets,
                                 total_tokens, num_kv_h, hdim,
@@ -552,54 +597,20 @@ void LlamaModel::forward_impl(const std::vector<RequestContext>& requests,
                 num_heads, num_kv_h, hdim,
                 kvc.block_size, stream);
         } else {
-            // Prefill: call paged attention per request.
-            // Each token in the request gets treated as a separate batch item,
-            // each attending to its causal prefix.
+            // Prefill: each token attends to its causal prefix.
+            // Use pre-allocated block tables and seq_lens (same every layer).
             int tok_offset = 0;
             for (size_t r = 0; r < requests.size(); ++r) {
-                int num_tok = tokens_per_request[r];
-
-                int req_max_blocks = std::max(
-                    1, static_cast<int>(requests[r].block_table.size()));
-
-                // Build per-token block table (each token uses same blocks)
-                std::vector<int> req_bt(num_tok * req_max_blocks, 0);
-                for (int t = 0; t < num_tok; ++t) {
-                    for (size_t b = 0;
-                         b < requests[r].block_table.size(); ++b) {
-                        req_bt[t * req_max_blocks + b] =
-                            requests[r].block_table[b];
-                    }
-                }
-                int* d_req_bt = nullptr;
-                cudaMalloc(&d_req_bt, req_bt.size() * sizeof(int));
-                cudaMemcpyAsync(d_req_bt, req_bt.data(),
-                                req_bt.size() * sizeof(int),
-                                cudaMemcpyHostToDevice, stream);
-
-                // Per-token seq_lens for causal masking
-                std::vector<int> tok_seq_lens(num_tok);
-                for (int t = 0; t < num_tok; ++t) {
-                    tok_seq_lens[t] = requests[r].prefill_start_pos + t + 1;
-                }
-                int* d_tok_sl = nullptr;
-                cudaMalloc(&d_tok_sl, num_tok * sizeof(int));
-                cudaMemcpyAsync(d_tok_sl, tok_seq_lens.data(),
-                                num_tok * sizeof(int),
-                                cudaMemcpyHostToDevice, stream);
-
+                const auto& pb = prefill_bufs[r];
                 launch_paged_attention(
                     q_buf + tok_offset * num_heads * hdim,
                     k_cache_l, v_cache_l,
                     attn_out + tok_offset * H,
-                    d_req_bt, req_max_blocks,
-                    d_tok_sl,
-                    num_tok, num_heads, num_kv_h, hdim,
+                    pb.d_bt, pb.req_max_blocks,
+                    pb.d_sl,
+                    pb.num_tok, num_heads, num_kv_h, hdim,
                     kvc.block_size, stream);
-
-                cudaFree(d_req_bt);
-                cudaFree(d_tok_sl);
-                tok_offset += num_tok;
+                tok_offset += pb.num_tok;
             }
         }
 
@@ -640,6 +651,7 @@ void LlamaModel::forward_impl(const std::vector<RequestContext>& requests,
         // l. Residual: hidden = hidden + normed
         launch_residual_add(hidden, normed, hidden,
                             total_tokens * H, stream);
+
     }
 
     // 6. Final RMSNorm
@@ -687,6 +699,19 @@ void LlamaModel::forward_impl(const std::vector<RequestContext>& requests,
 
     cudaStreamSynchronize(stream);
 
+    // DEBUG: print top-5 logits for multi-token prefill
+    if (is_prefill && total_tokens > 1) {
+        const float* logits = result.logits.data();
+        std::vector<int> idx(V);
+        std::iota(idx.begin(), idx.end(), 0);
+        std::partial_sort(idx.begin(), idx.begin() + 5, idx.end(),
+                          [&](int a, int b){ return logits[a] > logits[b]; });
+        std::cerr << "DEBUG top-5 logits (multi-tok prefill, " << total_tokens << " tokens): ";
+        for (int i = 0; i < 5; i++)
+            std::cerr << "tok" << idx[i] << "=" << logits[idx[i]] << " ";
+        std::cerr << "\n";
+    }
+
     // Cleanup temp GPU allocations
     cudaFree(d_token_ids);
     cudaFree(d_positions);
@@ -694,6 +719,10 @@ void LlamaModel::forward_impl(const std::vector<RequestContext>& requests,
     cudaFree(d_block_offsets);
     cudaFree(d_seq_lens);
     cudaFree(d_attn_block_table);
+    for (auto& pb : prefill_bufs) {
+        cudaFree(pb.d_bt);
+        cudaFree(pb.d_sl);
+    }
 }
 
 // ---------------------------------------------------------------------------

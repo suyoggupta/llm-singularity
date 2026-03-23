@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <vector>
 #include <cuda_runtime.h>
+#include "core/sampling.h"
 #include "core/types.h"
 #include "kernels/kernel_provider.h"
 
@@ -35,6 +36,7 @@ struct RequestContext {
     int prefill_chunk_len;
     std::vector<int> block_table;
     int max_new_tokens;
+    SamplingParams sampling_params;
 };
 
 struct ForwardResult {

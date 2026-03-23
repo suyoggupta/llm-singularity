@@ -249,19 +249,22 @@ TEST(KernelTest, RoPEPositionZero) {
 // CublasProvider GEMM Test
 // ---------------------------------------------------------------------------
 TEST(KernelTest, CublasGemm) {
-    // 2x3 * 3x4 = 2x4 matmul in float32
+    // GEMM computes C[M,N] = A[M,K] @ B^T  where B is [N,K] (HF weight layout).
+    // A = [[1,2,3],[4,5,6]]  shape [2,3]
+    // B = [[1,5,9],[2,6,10],[3,7,11],[4,8,12]]  shape [4,3] (each row is a "neuron")
+    // B^T = [[1,2,3,4],[5,6,7,8],[9,10,11,12]]  shape [3,4]
+    // C = A @ B^T = [[38,44,50,56],[83,98,113,128]]
     const int M = 2, N = 4, K = 3;
-    // A is row-major [2,3], B is row-major [3,4]
     std::vector<float> h_A = {1, 2, 3, 4, 5, 6};
-    std::vector<float> h_B = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    std::vector<float> h_B = {1, 5, 9, 2, 6, 10, 3, 7, 11, 4, 8, 12}; // [N=4, K=3] row-major
     std::vector<float> h_C(M * N, 0.0f);
 
     float *d_A, *d_B, *d_C;
     cudaMalloc(&d_A, M * K * sizeof(float));
-    cudaMalloc(&d_B, K * N * sizeof(float));
+    cudaMalloc(&d_B, N * K * sizeof(float));
     cudaMalloc(&d_C, M * N * sizeof(float));
     cudaMemcpy(d_A, h_A.data(), M * K * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, h_B.data(), K * N * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, h_B.data(), N * K * sizeof(float), cudaMemcpyHostToDevice);
 
     CublasProvider provider;
     GemmDescriptor desc;
@@ -276,12 +279,7 @@ TEST(KernelTest, CublasGemm) {
 
     cudaMemcpy(h_C.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
 
-    // C = A * B (row-major)
-    // C[0][0] = 1*1 + 2*5 + 3*9 = 38
-    // C[0][1] = 1*2 + 2*6 + 3*10 = 44
-    // C[0][2] = 1*3 + 2*7 + 3*11 = 50
-    // C[0][3] = 1*4 + 2*8 + 3*12 = 56
-    // C[1][0] = 4*1 + 5*5 + 6*9 = 83
+    // C = A @ B^T
     EXPECT_NEAR(h_C[0], 38.0f, 1e-3);
     EXPECT_NEAR(h_C[1], 44.0f, 1e-3);
     EXPECT_NEAR(h_C[2], 50.0f, 1e-3);

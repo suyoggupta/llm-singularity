@@ -155,6 +155,7 @@ ScheduledBatch Scheduler::form_batch() {
         ctx.prefill_chunk_len = chunk_len;
         ctx.block_table = areq.block_table;
         ctx.max_new_tokens = areq.max_new_tokens;
+        ctx.sampling_params = areq.sampling_params;
 
         batch.prefill_requests.push_back(std::move(ctx));
         tokens_used += chunk_len;
@@ -178,6 +179,7 @@ ScheduledBatch Scheduler::form_batch() {
         ctx.prefill_chunk_len = 0;
         ctx.block_table = areq.block_table;
         ctx.max_new_tokens = areq.max_new_tokens;
+        ctx.sampling_params = areq.sampling_params;
 
         batch.decode_requests.push_back(std::move(ctx));
         tokens_used += 1;  // decode uses 1 token

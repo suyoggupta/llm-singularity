@@ -9,6 +9,7 @@
 #include "kernels/attention.h"
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
 
 // Paged attention decode kernel.
 // Grid: (num_heads, batch_size)
@@ -58,7 +59,7 @@ __global__ void paged_attention_kernel(
     float* s_query = smem;  // [head_dim]
 
     // Load query into shared memory
-    for (int d = tid; d < head_dim; d += kBlockThreads) {
+    for (int d = tid; d < head_dim; d += blockDim.x) {
         s_query[d] = q_ptr[d];
     }
     __syncthreads();
@@ -75,7 +76,7 @@ __global__ void paged_attention_kernel(
         v_acc[d] = 0.0f;
     }
 
-    for (int pos = tid; pos < seq_len; pos += kBlockThreads) {
+    for (int pos = tid; pos < seq_len; pos += blockDim.x) {
         // Find which block and offset within block
         int cache_block_idx = bt[pos / block_size];
         int offset_in_block = pos % block_size;
@@ -128,8 +129,8 @@ __global__ void paged_attention_kernel(
     // s_sum: [kBlockThreads]
     // s_vacc: [kBlockThreads * head_dim]
     float* s_max = smem;
-    float* s_sum = smem + kBlockThreads;
-    float* s_vacc = smem + 2 * kBlockThreads;
+    float* s_sum = smem + blockDim.x;
+    float* s_vacc = smem + 2 * blockDim.x;
 
     s_max[tid] = thread_max;
     s_sum[tid] = thread_sum;
@@ -139,7 +140,7 @@ __global__ void paged_attention_kernel(
     __syncthreads();
 
     // Tree reduction
-    for (int stride = kBlockThreads / 2; stride > 0; stride >>= 1) {
+    for (int stride = static_cast<int>(blockDim.x) / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
             float my_max = s_max[tid];
             float other_max = s_max[tid + stride];
@@ -182,13 +183,21 @@ void launch_paged_attention(
 {
     float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
+    // Choose thread count to keep shared memory under 48KB.
+    // Reduction needs: (2*threads + threads*head_dim) * 4 bytes.
+    // For head_dim=128: threads * (2 + 128) * 4 = threads * 520.
+    // 48KB / 520 ≈ 94 threads → round down to power of 2 = 64.
+    // Use a single warp (32 threads) for simplicity and to avoid shared memory issues.
+    // For production, a more sophisticated approach is needed.
+    int threads = 32;
+
     dim3 grid(num_heads, batch_size);
-    dim3 block(kBlockThreads);
+    dim3 block(threads);
 
     // Shared memory: query [head_dim] during load phase,
-    // then reused for reduction: max[kBlockThreads] + sum[kBlockThreads] + vacc[kBlockThreads * head_dim]
+    // then reused for reduction: max[threads] + sum[threads] + vacc[threads * head_dim]
     size_t smem_query = head_dim * sizeof(float);
-    size_t smem_reduce = (2 * kBlockThreads + kBlockThreads * head_dim) * sizeof(float);
+    size_t smem_reduce = (2 * threads + threads * head_dim) * sizeof(float);
     size_t smem_size = (smem_query > smem_reduce) ? smem_query : smem_reduce;
 
     paged_attention_kernel<<<grid, block, smem_size, stream>>>(
@@ -196,4 +205,11 @@ void launch_paged_attention(
         block_table, max_blocks_per_seq, seq_lens,
         num_heads, num_kv_heads, head_dim,
         block_size, scale);
+
+    // Debug: check for launch errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ATTENTION KERNEL LAUNCH ERROR: %s (threads=%d, smem=%zu)\n",
+                cudaGetErrorString(err), threads, smem_size);
+    }
 }

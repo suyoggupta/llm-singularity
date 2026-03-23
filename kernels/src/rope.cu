@@ -17,8 +17,8 @@ __device__ void apply_rope_pair(float* x, int dim_pair, int head_dim,
     float cos_val = cosf(angle);
     float sin_val = sinf(angle);
 
-    int idx0 = 2 * dim_pair;
-    int idx1 = 2 * dim_pair + 1;
+    int idx0 = dim_pair;
+    int idx1 = dim_pair + head_dim / 2;
     float x0 = x[idx0];
     float x1 = x[idx1];
     x[idx0] = x0 * cos_val - x1 * sin_val;

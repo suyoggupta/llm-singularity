@@ -33,21 +33,22 @@ void CublasProvider::gemm(GemmDescriptor desc, const void* A, const void* B, voi
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
-    // Our data is row-major: A[M,K], B[K,N], C[M,N].
-    // cuBLAS operates column-major. The trick to compute C = A*B in row-major:
-    // Interpret everything as column-major transposed, then compute:
-    //   C^T = B^T * A^T
-    // In cuBLAS column-major terms (with no-op transpose since ^T of a
-    // row-major matrix is just reading it as column-major):
-    //   cublasSgemm(handle, N, N, M, K, &alpha, B, N, A, K, &beta, C, N)
+    // We want: C[M,N] = A[M,K] @ B^T[K,N]  where B is stored row-major as [N,K].
+    // This is the standard HF linear: output = input @ weight^T.
+    //
+    // cuBLAS is column-major. Row-major A[M,K] = col-major A_cm[K,M].
+    // Row-major B[N,K] = col-major B_cm[K,N].
+    //
+    // We want C_cm[N,M] = B_cm[K,N]^T @ A_cm[K,M] = B_cm^T[N,K] @ A_cm[K,M]
+    // This is: cublasSgemm(CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, alpha, B, K, A, K, beta, C, N)
     cublasSgemm(handle_,
-                CUBLAS_OP_N, CUBLAS_OP_N,
+                CUBLAS_OP_T, CUBLAS_OP_N,
                 desc.N, desc.M, desc.K,
                 &alpha,
-                static_cast<const float*>(B), desc.N,
-                static_cast<const float*>(A), desc.K,
+                static_cast<const float*>(B), desc.K,   // ldb = K (B is [N,K] in row-major = [K,N] in col-major)
+                static_cast<const float*>(A), desc.K,   // lda = K (A is [M,K] in row-major = [K,M] in col-major)
                 &beta,
-                static_cast<float*>(C), desc.N);
+                static_cast<float*>(C), desc.N);         // ldc = N
 }
 
 void CublasProvider::fused_attention(AttentionDescriptor desc,
