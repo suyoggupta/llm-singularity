@@ -11,3 +11,7 @@ add_executable(tests
 )
 target_link_libraries(tests PRIVATE core kernels llama_model GTest::gtest_main)
 add_test(NAME unit_tests COMMAND tests)
+
+# Debug tool for forward pass comparison
+add_executable(debug_dump debug_dump.cpp)
+target_link_libraries(debug_dump PRIVATE core kernels llama_model)

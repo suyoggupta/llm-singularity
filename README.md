@@ -77,7 +77,7 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "llama",
-    "messages": [{"role": "user", "content": "What is the capital of France?"}],
+    "messages": [{"role": "user", "content": "What is the meaning of life?"}],
     "max_tokens": 100,
     "stream": true
   }'
